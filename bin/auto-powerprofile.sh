@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
-# Auto + manual power profile manager for Ubuntu 25.10
-# Requires: powerprofilesctl, nvidia-smi, sensors, bc
+# Smart Power Profile Manager for Ubuntu 25.10
+# Dynamically switches between power-saver, balanced, and performance profiles.
+# Integrates with powerprofilesctl and powertop for tuning, but skips USB autosuspend
+# to prevent audio or input dropouts (e.g. DACs, mice, keyboards).
 
 CHECK_INTERVAL=5
 POWERTOP_ON_POWERSAVER=1
-NOTIFY=1
+
+# Notification control:
+# 1 = show notifications
+# 0 = disable notifications permanently
+# Create ~/.cache/powerprofile.silent to mute temporarily
+NOTIFY=0
+SILENT_FILE="$HOME/.cache/powerprofile.silent"
+
 OVERRIDE_FILE="$HOME/.cache/powerprofile.override"
 STATE_FILE="$HOME/.cache/powerprofile.state"
 
@@ -34,33 +43,80 @@ have_nvidia=0
 command -v nvidia-smi >/dev/null && have_nvidia=1
 last_target=""
 
+# ---------------------------------------------------------------------
+# Helper: notifications
+# ---------------------------------------------------------------------
 notify() {
-  ((NOTIFY)) || return
+  # Skip notifications if disabled or silent mode active
+  if (( !NOTIFY )) || [[ -f "$SILENT_FILE" ]]; then
+    return
+  fi
   command -v notify-send >/dev/null || return
   notify-send "Power Profile" "$1"
 }
 
+# ---------------------------------------------------------------------
+# Helper: safe PowerTOP tuning (skip USB autosuspend)
+# ---------------------------------------------------------------------
+safe_powertune() {
+  echo "Running PowerTOP (skip USB autosuspend completely)" >&2
+
+  # Generate a temporary copy of powertop tunables without USB entries
+  TMPFILE=$(mktemp)
+  sudo powertop --auto-tune --explain >"$TMPFILE" 2>/dev/null || true
+
+  # Manually apply only non-USB tunables
+  while IFS= read -r line; do
+    if [[ "$line" == *"/sys/bus/usb/"* ]]; then
+      continue
+    fi
+    if [[ "$line" == *"/sys/"*"/power/"* ]]; then
+      setting=$(echo "$line" | awk '{print $NF}')
+      [[ -f "$setting" ]] && echo auto | sudo tee "$setting" >/dev/null 2>&1
+    fi
+  done <"$TMPFILE"
+
+  rm -f "$TMPFILE"
+
+  # Finally, ensure all USB devices stay awake
+  for devpath in /sys/bus/usb/devices/*; do
+    if [ -f "$devpath/power/control" ]; then
+      echo on | sudo tee "$devpath/power/control" >/dev/null
+    fi
+  done
+}
+
+
+# ---------------------------------------------------------------------
+# Helper: set power profile
+# ---------------------------------------------------------------------
 set_profile() {
   local target="$1"
   local current
   current=$(powerprofilesctl get)
   [[ "$current" == "$target" ]] && return
   powerprofilesctl set "$target"
+
   case "$target" in
     power-saver)
-      ((POWERTOP_ON_POWERSAVER)) && sudo -n powertop --auto-tune >/dev/null 2>&1
-      notify "🌙 Quiet mode (power-saver)"
+      ((POWERTOP_ON_POWERSAVER)) && safe_powertune
+      ((NOTIFY)) && [[ ! -f "$SILENT_FILE" ]] && notify "🌙 Quiet mode (power-saver)"
       ;;
     balanced)
-      notify "⚙️ Balanced mode"
+      ((NOTIFY)) && [[ ! -f "$SILENT_FILE" ]] && notify "⚙️ Balanced mode"
       ;;
     performance)
-      notify "⚡ Performance mode"
+      ((NOTIFY)) && [[ ! -f "$SILENT_FILE" ]] && notify "⚡ Performance mode"
       ;;
   esac
+
   echo "$target" > "$STATE_FILE"
 }
 
+
+# ---------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------
 while true; do
   # Manual override
   if [[ -f "$OVERRIDE_FILE" ]]; then
@@ -90,7 +146,6 @@ while true; do
 
   case "$last_target" in
     power-saver)
-      # Jump up fast if we cross upper thresholds
       if (( force_perf==1 )) ||
          (( $(echo "$load > $LOAD_PERF_UP" | bc -l) )) ||
          (( $(echo "$temp > $TEMP_PERF_UP" | bc -l) )) ||
@@ -104,14 +159,12 @@ while true; do
       fi
       ;;
     balanced)
-      # Jump up if hitting performance trigger
       if (( force_perf==1 )) ||
          (( $(echo "$load > $LOAD_PERF_UP" | bc -l) )) ||
          (( $(echo "$temp > $TEMP_PERF_UP" | bc -l) )) ||
          (( $(echo "$gpu_util > $GPU_UTIL_PERF_UP" | bc -l) )) ||
          (( $(echo "$gpu_pwr > $GPU_PWR_PERF_UP" | bc -l) )); then
         target="performance"
-      # Drop down only if all calm below lower balanced thresholds
       elif (( $(echo "$load < $LOAD_BALANCED_DOWN" | bc -l) )) &&
            (( $(echo "$temp < $TEMP_BALANCED_DOWN" | bc -l) )) &&
            (( $(echo "$gpu_util < $GPU_UTIL_BALANCED_DOWN" | bc -l) )); then
@@ -119,7 +172,6 @@ while true; do
       fi
       ;;
     performance)
-      # Drop back only when well below performance thresholds
       if (( $(echo "$load < $LOAD_PERF_DOWN" | bc -l) )) &&
          (( $(echo "$temp < $TEMP_PERF_DOWN" | bc -l) )) &&
          (( $(echo "$gpu_util < $GPU_UTIL_PERF_DOWN" | bc -l) )) &&
