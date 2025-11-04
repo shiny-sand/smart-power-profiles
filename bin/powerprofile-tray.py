@@ -75,11 +75,14 @@ def monitor_loop():
 # ------------------------------------------------------------
 indicator = AppIndicator3.Indicator.new(
     "powerprofile-indicator",
-    "battery",
+    "indicator-messages",  # invisible placeholder in most icon themes
     AppIndicator3.IndicatorCategory.APPLICATION_STATUS
 )
 indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+indicator.set_label("🌙", "")  # start with moon icon
 refresh_icon()
+
+
 
 menu = Gtk.Menu()
 for label, mode in [

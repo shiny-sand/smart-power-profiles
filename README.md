@@ -1,187 +1,121 @@
-# 🧠 Smart Power Profiles for Linux
+# Smart Power Profiles
 
-**Smart Power Profiles** automatically switches between **power-saver**, **balanced**, and **performance** modes on GNOME desktops.  
-It monitors CPU load, temperature, and GPU activity — boosting performance when you need it and saving watts when you don’t.  
-A small tray icon (🌙 ⚙️ ⚡) lets you override or return to auto mode at any time.
+Smart Power Profiles automatically adjusts CPU and GPU performance modes on Ubuntu 25.10 based on system load, temperature, and running applications. It also includes a lightweight tray indicator for quick manual switching.
 
 ---
 
-## ✨ Features
-- **Automatic profile switching** based on CPU load, temperature, and NVIDIA GPU usage  
-- **Tray indicator** for manual control and quick status view  
-- **Manual override system** (lock any profile or clear override to resume auto)  
-- **GPU-aware** (detects heavy gaming or rendering)  
-- **Process awareness** (auto-boost when Steam, OBS, Blender, etc. are open)  
-- **Powertop auto-tuning** when entering power-saver mode  
-- **Pure Bash + Python**, no daemons or root services required  
+## ⚙️ Features
+
+- Dynamic auto-switching between **power-saver**, **balanced**, and **performance** profiles
+- Tray indicator with emoji status 🌙 ⚙️ ⚡
+- Manual override with automatic resume (“Auto”)
+- Systemd integration for clean startup and management
+- Optional Powertop tuning when entering power-saver mode
 
 ---
 
-## 🧩 Components
+## 📦 Installation & Updates
 
-| File | Role |
-|------|------|
-| `bin/auto-powerprofile.sh` | Background daemon. Checks CPU/GPU load and temperature every few seconds and calls `powerprofilesctl` accordingly. |
-| `bin/powerprofile-tray.py` | Tray application showing 🌙 ⚙️ ⚡ and allowing manual control or “Auto” mode. |
-| `~/.cache/powerprofile.override` | Manual override file (created when you pick a fixed profile). |
-| `~/.cache/powerprofile.state` | Stores the last applied mode (read by the tray). |
-
----
-
-## ⚙️ Requirements
-
-Ubuntu 25.10 (or any modern GNOME-based distro).
-
-```bash
-sudo apt install power-profiles-daemon powertop lm-sensors bc \
-  python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
-  libayatana-appindicator3-1 nvidia-utils-550
-```
-
-Enable AppIndicator support:
-
-```bash
-gnome-extensions enable ubuntu-appindicators@ubuntu.com
-```
-
----
-
-## 🚀 Installation
+Clone and install (first time or to update to the latest version):
 
 ```bash
 git clone https://github.com/shiny-sand/smart-power-profiles.git
 cd smart-power-profiles
-chmod +x bin/auto-powerprofile.sh bin/powerprofile-tray.py
+./install.sh
 ```
 
-Test manually:
+The installer will:
 
-```bash
-./bin/auto-powerprofile.sh &
-./bin/powerprofile-tray.py &
-```
+- Copy scripts to `~/bin/`
+- Create/update the **systemd --user** services
+- Enable and start them for your current user
 
-You should see the tray icon appear in the top-right panel.
-
----
-
-## 🔧 Autostart at Login
-
-```bash
-mkdir -p ~/.config/autostart
-cat > ~/.config/autostart/smart-power-daemon.desktop <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=Smart Power Daemon
-Exec=/home/YOURUSERNAME/Projects/smart-power-profiles/bin/auto-powerprofile.sh
-X-GNOME-Autostart-enabled=true
-EOF
-
-cat > ~/.config/autostart/smart-power-tray.desktop <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=Smart Power Tray
-Exec=/home/YOURUSERNAME/Projects/smart-power-profiles/bin/powerprofile-tray.py
-X-GNOME-Autostart-enabled=true
-EOF
-```
-
-Replace `YOURUSERNAME` with your login name, then re-log.
+You can safely re-run `./install.sh` any time to redeploy updates.
 
 ---
 
-## 🪄 Usage
+## 🧩 Services (recommended)
 
-- 🌙 **Power-Saver** – lowest power draw; triggers at idle  
-- ⚙️ **Balanced** – default everyday mode  
-- ⚡ **Performance** – activates under heavy CPU/GPU load or when specific apps run  
-- 🧠 **Auto Mode** – lets the daemon decide dynamically  
+Both components run as **systemd --user** services for reliable startup on login and easy restarts.
 
-**Manual override:**  
-Pick any mode from the tray menu; it stays fixed until you select **Auto** again.
-
----
-
-## 🧠 How Auto Mode Works
-
-1. The daemon samples metrics every 10 s.  
-2. Thresholds determine which profile to activate.  
-3. When you select a fixed mode, the tray writes `~/.cache/powerprofile.override`.  
-4. The daemon pauses automatic switching while that file exists.  
-5. Choosing *Auto* deletes the file; the daemon resumes control.  
-6. The active mode is recorded in `~/.cache/powerprofile.state`.
-
----
-
-## 🧮 Configuration
-
-Edit thresholds near the top of `auto-powerprofile.sh`:
-
-```bash
-LOAD_BALANCED=1.0
-LOAD_PERF=4.0
-TEMP_BALANCED=50
-TEMP_PERF=70
-GPU_UTIL_BALANCED=15
-GPU_UTIL_PERF=40
-GPU_PWR_PERF=90
-CHECK_INTERVAL=10
-FORCE_PERF_PROCS="steam|obs|resolve|blender|davinci|gamescope|proton"
-```
-
-Restart the daemon after changes.
-
----
-
-## 🧰 Optional systemd (user) service
-
+### Daemon service
 `~/.config/systemd/user/smart-power-daemon.service`
-
 ```ini
 [Unit]
 Description=Smart Power Profiles Daemon
 After=graphical-session.target
 
 [Service]
-ExecStart=%h/Projects/smart-power-profiles/bin/auto-powerprofile.sh
+ExecStart=%h/bin/auto-powerprofile.sh
 Restart=always
+RestartSec=2
 
 [Install]
 WantedBy=default.target
 ```
 
-Enable it:
+### Tray service
+`~/.config/systemd/user/smart-power-tray.service`
+```ini
+[Unit]
+Description=Smart Power Profiles Tray
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/bin/powerprofile-tray.py
+Restart=always
+RestartSec=2
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+
+[Install]
+WantedBy=default.target
+```
+
+Enable (or restart) services:
 
 ```bash
-systemctl --user enable --now smart-power-daemon.service
+systemctl --user daemon-reload
+systemctl --user enable --now smart-power-daemon.service smart-power-tray.service
+
+# later, when updating:
+systemctl --user restart smart-power-daemon.service smart-power-tray.service
+```
+
+This **replaces older `.desktop` autostart** methods.  
+If you previously created autostart entries, you can remove them:
+
+```
+~/.config/autostart/powerprofile-tray.desktop
+~/.local/share/applications/powerprofile-tray.desktop
 ```
 
 ---
 
-## 🧭 Roadmap
-- GPU temperature support  
-- Battery/UPS integration  
-- JSON rules for per-app profiles  
-- GNOME Shell extension for native UI  
-- Flatpak / DEB packaging  
+## 🧠 Usage
+
+- The tray icon shows the current mode via emoji:
+  - 🌙 **power-saver**
+  - ⚙️ **balanced**
+  - ⚡ **performance**
+- Click the tray icon to pick a mode or choose **Auto (remove override)** to let the daemon manage switching again.
+- The current active profile is stored in `~/.cache/powerprofile.state`.
+- If Powertop is installed, auto-tuning will be applied on entry to power-saver mode.
 
 ---
 
-## 📄 License
-MIT © 2025 shiny-sand  
-Free to use, modify, and distribute with attribution.
+## 🧹 Troubleshooting
+
+- On GNOME + Wayland, a small “…” placeholder can appear next to the emoji in the tray. This is a harmless quirk of the AppIndicator host and does not affect functionality.
+- Verify services are active:
+  ```bash
+  systemctl --user status smart-power-daemon.service
+  systemctl --user status smart-power-tray.service
+  ```
+- If you don’t see the tray icon, ensure the **AppIndicator** extension is enabled (Ubuntu enables it by default).
 
 ---
 
-## 💬 Contributing
-Pull requests are welcome!  
-When reporting issues, include:
-- Distro + GNOME version  
-- Expected vs actual behavior  
-- `~/.cache/powerprofile.state` contents
+## 🧾 License
 
----
-
-### ❤️ Credits
-Created by **shiny-sand** with help from ChatGPT (GPT-5).  
-Inspired by the idea that desktops deserve laptop-grade efficiency.
+MIT License © 2025 shiny-sand
