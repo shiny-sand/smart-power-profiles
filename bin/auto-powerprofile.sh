@@ -2,27 +2,37 @@
 # Auto + manual power profile manager for Ubuntu 25.10
 # Requires: powerprofilesctl, nvidia-smi, sensors, bc
 
-CHECK_INTERVAL=10
-DWELL_READS=3
+CHECK_INTERVAL=5
 POWERTOP_ON_POWERSAVER=1
 NOTIFY=1
 OVERRIDE_FILE="$HOME/.cache/powerprofile.override"
 STATE_FILE="$HOME/.cache/powerprofile.state"
 
-LOAD_BALANCED=1.0
-LOAD_PERF=4.0
-TEMP_BALANCED=50
-TEMP_PERF=70
-GPU_UTIL_BALANCED=15
-GPU_UTIL_PERF=40
-GPU_PWR_PERF=90
+# --- Thresholds ---
+# "Enter" thresholds (go up)
+LOAD_BALANCED_UP=1.5
+LOAD_PERF_UP=4.0
+TEMP_BALANCED_UP=55
+TEMP_PERF_UP=70
+GPU_UTIL_BALANCED_UP=20
+GPU_UTIL_PERF_UP=40
+GPU_PWR_PERF_UP=90
+
+# "Exit" thresholds (go down)
+LOAD_BALANCED_DOWN=1.0
+LOAD_PERF_DOWN=2.5
+TEMP_BALANCED_DOWN=45
+TEMP_PERF_DOWN=60
+GPU_UTIL_BALANCED_DOWN=10
+GPU_UTIL_PERF_DOWN=25
+GPU_PWR_PERF_DOWN=60
+
 FORCE_PERF_PROCS="steam|obs|resolve|blender|davinci|gamescope|proton"
 
 mkdir -p "$(dirname "$STATE_FILE")"
 have_nvidia=0
 command -v nvidia-smi >/dev/null && have_nvidia=1
 last_target=""
-need_reads=0
 
 notify() {
   ((NOTIFY)) || return
@@ -52,7 +62,7 @@ set_profile() {
 }
 
 while true; do
-  # Manual override?
+  # Manual override
   if [[ -f "$OVERRIDE_FILE" ]]; then
     override=$(<"$OVERRIDE_FILE")
     [[ -n "$override" ]] && set_profile "$override"
@@ -76,26 +86,54 @@ while true; do
     force_perf=1
   fi
 
-  target="power-saver"
-  perf_cond=$(awk -v l="$load" -v t="$temp" -v gu="$gpu_util" -v gp="$gpu_pwr" \
-    -v lp="$LOAD_PERF" -v tp="$TEMP_PERF" -v gup="$GPU_UTIL_PERF" -v gpp="$GPU_PWR_PERF" \
-    'BEGIN{if (l>lp||t>tp||gu>gup||gp>gpp) print 1; else print 0}')
-  bal_cond=$(awk -v l="$load" -v t="$temp" -v gu="$gpu_util" \
-    -v lb="$LOAD_BALANCED" -v tb="$TEMP_BALANCED" -v gub="$GPU_UTIL_BALANCED" \
-    'BEGIN{if (l>lb||t>tb||gu>gub) print 1; else print 0}')
+  target="$last_target"
 
-  if (( force_perf==1 || perf_cond==1 )); then
-    target="performance"
-  elif (( bal_cond==1 )); then
-    target="balanced"
-  fi
+  case "$last_target" in
+    power-saver)
+      # Jump up fast if we cross upper thresholds
+      if (( force_perf==1 )) ||
+         (( $(echo "$load > $LOAD_PERF_UP" | bc -l) )) ||
+         (( $(echo "$temp > $TEMP_PERF_UP" | bc -l) )) ||
+         (( $(echo "$gpu_util > $GPU_UTIL_PERF_UP" | bc -l) )) ||
+         (( $(echo "$gpu_pwr > $GPU_PWR_PERF_UP" | bc -l) )); then
+        target="performance"
+      elif (( $(echo "$load > $LOAD_BALANCED_UP" | bc -l) )) ||
+           (( $(echo "$temp > $TEMP_BALANCED_UP" | bc -l) )) ||
+           (( $(echo "$gpu_util > $GPU_UTIL_BALANCED_UP" | bc -l) )); then
+        target="balanced"
+      fi
+      ;;
+    balanced)
+      # Jump up if hitting performance trigger
+      if (( force_perf==1 )) ||
+         (( $(echo "$load > $LOAD_PERF_UP" | bc -l) )) ||
+         (( $(echo "$temp > $TEMP_PERF_UP" | bc -l) )) ||
+         (( $(echo "$gpu_util > $GPU_UTIL_PERF_UP" | bc -l) )) ||
+         (( $(echo "$gpu_pwr > $GPU_PWR_PERF_UP" | bc -l) )); then
+        target="performance"
+      # Drop down only if all calm below lower balanced thresholds
+      elif (( $(echo "$load < $LOAD_BALANCED_DOWN" | bc -l) )) &&
+           (( $(echo "$temp < $TEMP_BALANCED_DOWN" | bc -l) )) &&
+           (( $(echo "$gpu_util < $GPU_UTIL_BALANCED_DOWN" | bc -l) )); then
+        target="power-saver"
+      fi
+      ;;
+    performance)
+      # Drop back only when well below performance thresholds
+      if (( $(echo "$load < $LOAD_PERF_DOWN" | bc -l) )) &&
+         (( $(echo "$temp < $TEMP_PERF_DOWN" | bc -l) )) &&
+         (( $(echo "$gpu_util < $GPU_UTIL_PERF_DOWN" | bc -l) )) &&
+         (( $(echo "$gpu_pwr < $GPU_PWR_PERF_DOWN" | bc -l) )); then
+        target="balanced"
+      fi
+      ;;
+    *)
+      target="power-saver"
+      ;;
+  esac
 
   if [[ "$target" != "$last_target" ]]; then
     last_target="$target"
-    need_reads=$DWELL_READS
-  elif (( need_reads > 0 )); then
-    need_reads=$((need_reads-1))
-  else
     set_profile "$target"
   fi
 
