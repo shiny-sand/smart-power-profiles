@@ -8,7 +8,8 @@
 # - Single-instance guard (flock)
 # - Desktop-biased thresholds + hysteresis
 # - Spike accelerator for quick boosts
-# - Optional GPU util + GPU temp awareness
+# - Optional GPU util + CPU/GPU temp awareness
+# - GPU temp trigger with hwmon-first, nvidia-smi fallback (cached)
 # - Debounced notifications
 # - Sanitized manual override (~/.cache/powerprofile.override)
 
@@ -62,10 +63,14 @@ TEMP_PERF_EXIT=70
 TEMP_BAL_ENTER=60
 TEMP_BAL_EXIT=45
 
-# Optional GPU temperature trigger (on by default per your request).
+# GPU temperature trigger (on by default).
 # If GPU temp >= GPU_TEMP_PERF_ENTER → force performance.
 GPU_TEMP_AWARE=1
 GPU_TEMP_PERF_ENTER=37
+
+# Cache window for nvidia-smi temperature reads (seconds)
+GPU_TEMP_CACHE_SEC=10
+GPU_TEMP_CACHE_FILE="$CACHE_DIR/powerprofile.gputemp"
 
 # ===== Helpers =====
 notify() {
@@ -76,9 +81,7 @@ notify() {
   local now last=0
   now=$(date +%s)
   [[ -r "$LAST_NOTIFY_FILE" ]] && last=$(<"$LAST_NOTIFY_FILE")
-  if (( now - last < NOTIFY_COOLDOWN )); then
-    return 0
-  fi
+  (( now - last < NOTIFY_COOLDOWN )) && return 0
 
   if [[ -n "${2-}" ]]; then
     notify-send -a "Smart Power Profiles" "$1" "$2" || true
@@ -117,7 +120,6 @@ read_cpu_load() { awk '{print $1}' /proc/loadavg; }
 # Short-interval CPU busy% from /proc/stat deltas
 _prev_total=0 _prev_idle_all=0 _have_prev=0
 read_cpu_short_busy_pct() {
-  # Parse the aggregate "cpu" line once
   local cpu user nice system idle iowait irq softirq steal guest guest_nice
   read -r cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
 
@@ -139,15 +141,13 @@ read_cpu_short_busy_pct() {
   _prev_idle_all=idle_all
 
   (( d_total <= 0 )) && { echo 0; return; }
-  # busy% = (d_total - d_idle) / d_total * 100
   awk -v dt="$d_total" -v di="$d_idle" 'BEGIN{printf "%.0f", (dt - di) * 100.0 / dt}'
 }
 
-read_cpu_temp() {
-  [[ $TEMP_AWARE -eq 1 ]] || { echo 0; return; }
+# ----- CPU temperature (optional) -----
+read_cpu_temp_only() {
   local t=""
   if command -v sensors >/dev/null 2>&1; then
-    # Try several common keys: "Package id 0:", "Tctl:", "Tdie:"
     t=$(sensors 2>/dev/null | awk '
       /Package id 0:|Tctl:|Tdie:/ {
         for (i=1;i<=NF;i++) if ($i ~ /\+?[0-9]+(\.[0-9]+)?°C/) {
@@ -155,15 +155,19 @@ read_cpu_temp() {
         }
       }' | head -n1)
   fi
-  # Fallback to thermal_zone0 if available (millidegrees)
   if [[ -z "${t:-}" ]] && [[ -r /sys/class/thermal/thermal_zone0/temp ]]; then
-    local raw
-    raw=$(< /sys/class/thermal/thermal_zone0/temp)
-    [[ "$raw" =~ ^[0-9]+$ ]] && t=$(( raw / 1000 ))
+    local raw; raw=$(< /sys/class/thermal/thermal_zone0/temp)
+    [[ "$raw" =~ ^[0-9]+$ ]] && t=$(( raw/1000 ))
   fi
   echo "${t:-0}"
 }
 
+read_cpu_temp() {
+  [[ $TEMP_AWARE -eq 1 ]] || { echo 0; return; }
+  read_cpu_temp_only
+}
+
+# ----- GPU util (optional) -----
 have_nvidia=0
 command -v nvidia-smi >/dev/null 2>&1 && have_nvidia=1
 
@@ -184,22 +188,72 @@ read_gpu_util() {
   (( n > a )) && echo "$n" || echo "$a"
 }
 
+# ----- GPU temperature (trigger) -----
+# hwmon-first scan
+read_gpu_temp_hwmon() {
+  local t=0 cur=0 f nm
+
+  # Prefer DRM-linked hwmon
+  while IFS= read -r f; do
+    nm="$(cat "$(dirname "$f")/name" 2>/dev/null || true)"
+    if [[ "$nm" =~ (nvidia|amdgpu|radeon) ]]; then
+      if [[ -r "$f" ]]; then
+        cur=$(<"$f" 2>/dev/null || echo 0)
+        [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+        (( cur > 1000 )) && cur=$((cur/1000))
+        (( cur > t )) && t=$cur
+      fi
+    fi
+  done < <(find /sys/class/drm -type f -path "*/device/hwmon/hwmon*/temp*_input" 2>/dev/null)
+
+  # Fallback: generic hwmon scan
+  if (( t == 0 )); then
+    while IFS= read -r f; do
+      nm="$(cat "$(dirname "$f")/name" 2>/dev/null || true)"
+      if [[ "$nm" =~ (nvidia|amdgpu|radeon) ]]; then
+        cur=$(<"$f" 2>/dev/null || echo 0)
+        [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+        (( cur > 1000 )) && cur=$((cur/1000))
+        (( cur > t )) && t=$cur
+      fi
+    done < <(find /sys/class/hwmon -type f -name "temp*_input" 2>/dev/null)
+  fi
+
+  echo "$t"
+}
+
+# Cached NVIDIA temp via nvidia-smi to avoid polling overhead
+read_gpu_temp_nv() {
+  command -v nvidia-smi >/dev/null 2>&1 || { echo 0; return; }
+  local now ts=0 age=0 cached=0
+  now=$(date +%s)
+
+  if [[ -r "$GPU_TEMP_CACHE_FILE" ]]; then
+    IFS=' ' read -r ts cached < "$GPU_TEMP_CACHE_FILE" || true
+    [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
+    [[ "$cached" =~ ^[0-9]+$ ]] || cached=0
+    age=$(( now - ts ))
+    if (( age < GPU_TEMP_CACHE_SEC )); then
+      echo "$cached"
+      return
+    fi
+  fi
+
+  local t
+  t=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null \
+      | awk 'max<$1{max=$1}END{print (max+0)}')
+  [[ "$t" =~ ^[0-9]+$ ]] || t=0
+  printf "%s %s\n" "$now" "$t" > "$GPU_TEMP_CACHE_FILE" 2>/dev/null || true
+  echo "$t"
+}
+
 read_gpu_temp() {
   [[ $GPU_TEMP_AWARE -eq 1 ]] || { echo 0; return; }
-  if (( have_nvidia )); then
-    local t
-    t=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -n1)
-    [[ "$t" =~ ^[0-9]+$ ]] && { echo "$t"; return; }
-  fi
-  # Generic fallback: first hwmon temp*_input under a GPU-ish name
-  local path
-  while IFS= read -r path; do
-    local raw; raw=$(<"$path" 2>/dev/null || true)
-    [[ "$raw" =~ ^[0-9]+$ ]] || continue
-    if (( raw > 1000 )); then echo $((raw/1000)); else echo "$raw"; fi
-    return
-  done < <(grep -rilE 'gpu|amdgpu|nvidia' /sys/class/hwmon 2>/dev/null | xargs -r -I{} find "{}" -maxdepth 1 -name 'temp*_input' 2>/dev/null)
-  echo 0
+  local t
+  t=$(read_gpu_temp_hwmon)
+  (( t > 0 )) && { echo "$t"; return; }
+  t=$(read_gpu_temp_nv)
+  echo "$t"
 }
 
 ppd_get() {
@@ -238,12 +292,12 @@ decide_profile() {
     local o; o=$(tr -d '\r\n\t ' <"$OVERRIDE_FILE")
     case "${o:-}" in
       power-saver|balanced|performance) echo "$o"; return ;;
-      auto|'') : > "$OVERRIDE_FILE" ;; # clear and continue auto
-      *)        : > "$OVERRIDE_FILE" ;; # scrub garbage
+      auto|'') : > "$OVERRIDE_FILE" ;;  # clear and continue auto
+      *)        : > "$OVERRIDE_FILE" ;;  # scrub garbage
     esac
   fi
 
-  # Immediate GPU temp trigger
+  # Immediate GPU temp trigger (your 37°C rule)
   if [[ $GPU_TEMP_AWARE -eq 1 ]] && (( gpu_temp >= GPU_TEMP_PERF_ENTER )); then
     echo "performance"
     return

@@ -1,210 +1,260 @@
+
 # Smart Power Profiles (Ubuntu 25.10+)
 
-Smart Power Profiles auto-switches between **power-saver**, **balanced**, and **performance** based on live **CPU load**, **CPU temps**, and **GPU activity**. It runs as a **systemd --user** daemon with a tiny tray app for quick overrides.
+Save watts when your desktop is idle and snap to full performance when you start real work.  
+This project drives **power-profiles-daemon** using a tiny shell daemon and a tray helper. No powertop, no kernel tweaks, no sudoers hacks.
 
-This project is designed to be **clone → install → go** for the average GitHub user. No root daemons. Sensible defaults. Safe fallbacks. Optional Powertop tuning.
-
----
-
-## ✨ Highlights
-
-- **Auto switching** with hysteresis to avoid flapping
-- **GPU aware**: NVIDIA via `nvidia-smi`, AMD via `gpu_busy_percent`
-- **Heavy-app fast path** (Steam/OBS/Blender etc. bump to performance)
-- **Optional Powertop** when entering power‑saver (USB‑safe)
-- **Tray indicator (text-only)** that shows **A:** or **M:** and the active profile, e.g. `A: Balanced` or `M: Performance`
-- **Manual override** via tray or a simple flag file
-- **Notification silence** via a single flag file
-- Clean **systemd --user** services; no PAM spam or password prompts
+> Runs as user services in your desktop session. Works great on powerful desktops that should be quiet at idle and fast under load.
 
 ---
 
-## 🧩 Requirements
+## Highlights
 
-- Ubuntu 25.10 (GNOME/Wayland tested)
-- Packages (installer will pull them):  
-  `python3-gi gir1.2-gtk-3.0 libnotify-bin power-profiles-daemon lm-sensors powertop bc`
-- Optional:
-  - NVIDIA: `nvidia-smi` (provided by the driver) for GPU util
-  - `cpupower` (from `linux-tools-common` on Ubuntu) for governor hints
-
-> If NVIDIA/AMD metrics aren’t available, the daemon still works using CPU load/temps.
+- Auto switches between **power-saver**, **balanced**, and **performance** using CPU load with hysteresis.
+- Optional **spike accelerator** so brief bursts can jump to performance quickly.
+- Optional **GPU utilization** awareness (NVIDIA via `nvidia-smi`, AMD via `gpu_busy_percent`) so 3D wakes performance fast.
+- Optional **GPU temperature** trigger (default on) so performance engages if the GPU goes above a small threshold.
+- Optional **CPU temperature** awareness if you want to de-rate under sustained heat.
+- **Text-only tray** shows current mode and lets you toggle Auto or pick a mode manually.
+- Safe by default: runs in user space, writes small state files in `~/.cache`, and uses conservative systemd hardening.
 
 ---
 
-## 🚀 Install / Update
+## Requirements
 
+- Ubuntu 25.10 or newer (GNOME session). It may work on other recent distros that ship power-profiles-daemon.
+- Packages are installed by the installer:
+  - `power-profiles-daemon`
+  - `python3-gi`, `gir1.2-gtk-3.0`
+  - `gir1.2-ayatanaappindicator3-0.1`, `libayatana-appindicator3-1` (tray)
+  - `libnotify-bin` (notifications), `lm-sensors`, `bc`
+- Optional for GPU integration:
+  - NVIDIA: `nvidia-smi` present from the proprietary driver.
+  - AMD: `/sys/class/drm/*/gpu_busy_percent` from amdgpu driver.
+
+---
+
+## Install
+
+Clone or copy this repo, then run the installer from the project root:
 ```bash
-git clone https://github.com/shiny-sand/smart-power-profiles.git
-cd smart-power-profiles
 ./install.sh
 ```
 
-The installer:
-- Installs deps
-- Copies scripts to `~/bin/`
-- Creates **systemd --user** units
-- Starts **daemon** and **tray**
+What it does:
+- Installs dependencies with `apt`.
+- Installs scripts to `~/bin`:
+  - `auto-powerprofile.sh` (daemon)
+  - `powerprofile-tray.py` (tray)
+  - `debug-powerprofile.sh` (quick status)
+- Creates and enables these **user** systemd units:
+  - `smart-power-daemon.service`
+  - `smart-power-tray.service`
 
-It also **offers** (prompted) to create a **sudoers snippet** that allows passwordless `powertop` and `cpupower` for your user:
+Services start immediately in your session. You can verify:
+
+```bash
+systemctl --user status smart-power-daemon.service
+systemctl --user status smart-power-tray.service
 ```
-/etc/sudoers.d/smart-power
-<your_user> ALL=(ALL) NOPASSWD: /usr/sbin/powertop, /usr/bin/cpupower
-```
-This is optional. If you skip it, the daemon simply **skips Powertop** instead of spamming PAM.
 
 ---
 
-## 🖥️ Tray (text-only, compact)
+## Uninstall
 
-The tray label shows:
-- `A: <Profile>` when **Auto** is active
-- `M: <Profile>` when **Manual override** is active
+From the project root:
+```bash
+./uninstall.sh
+```
 
-Examples:
-- `A: Balanced`
-- `M: Performance`
-- `A: Power Saver`
-
-Menu items:
-- **Auto** (remove manual override)
-- **Power Saver / Balanced / Performance** (manual pick)
-- **Notifications** toggle
-- **Appearance** (label/format, no icons)
-- **Open Debug Snapshot**
-- **Quit**
-
-> The project intentionally avoids themed icons because they’re unreliable across themes and can render as `…` when a theme doesn’t ship the name. Text is robust and minimal.
+It stops and disables the user services, removes unit files and scripts, and cleans cache files under `~/.cache`.
 
 ---
 
-## ⚙️ How it decides
+## How it decides modes
 
-The daemon samples every few seconds and chooses a target profile. It uses **hysteresis thresholds** and a **“heavy app” fast path** to jump straight to **performance** when certain processes are detected (Steam, OBS, Blender, DaVinci, etc.).
+The daemon reads a few simple signals every couple of seconds and decides which profile to apply.
 
-You can tune thresholds at the top of `~/bin/auto-powerprofile.sh`, then:
+- **CPU load (1-minute)** guides the baseline mode with **hysteresis** so it does not flap.
+- **Spike accelerator** uses a short CPU busy percentage to catch sudden bursts.
+- Optional **GPU utilization** promotes faster boosts when you start 3D or compute.
+- Optional **GPU temperature** trigger promotes to performance when the GPU warms up.
+- Optional **CPU temperature** can be used to avoid staying in performance if things get hot for a long time.
+
+A tiny cache in `~/.cache` is written for the tray:
+
+- `powerprofile.state`  the current effective profile
+- `powerprofile.last`   the last target the daemon tried to set
+- `powerprofile.override` a manual mode if you want to force a profile
+- `powerprofile.silent` presence disables notifications
+
+---
+
+## Quickstart for desktops
+
+The defaults are tuned for a powerful desktop that should idle low and boost quickly.
+
+- Check live decisions:
+  ```bash
+  ~/bin/debug-powerprofile.sh
+  journalctl --user -fu smart-power-daemon.service
+  ```
+
+- Force a manual profile (until you remove the override file):
+  ```bash
+  echo performance > ~/.cache/powerprofile.override
+  # back to auto:
+  rm -f ~/.cache/powerprofile.override
+  ```
+
+- Silence popups:
+  ```bash
+  touch ~/.cache/powerprofile.silent
+  ```
+
+- Tray tips:
+  - The tray shows `A: Balanced` or `M: Performance` etc. A means Auto, M means Manual.
+  - Toggle Auto in the tray or pick a profile. Manual writes the override file for you.
+
+---
+
+## Configuration knobs
+
+Edit `~/bin/auto-powerprofile.sh` and adjust the block near the top. Then restart the daemon:
 
 ```bash
 systemctl --user restart smart-power-daemon.service
 ```
 
----
+Default desktop-biased settings:
 
-## 🔌 Powertop integration (USB‑safe)
-
-When entering **power-saver**, the daemon can run:
-
-- `powertop --auto-tune` (if allowed without password)
-- Then **keeps USB awake** (`power/control=on`) to avoid DAC/keyboard/mouse/webcam issues
-
-It will **not** attempt to run Powertop unless the NOPASSWD rule exists (or you explicitly allowed it). This prevents **`pam_unix` spam** in the journal from password prompts that can’t be answered inside a user service.
-
-You can verify Powertop ran with these markers/logs:
 ```bash
-cat ~/.cache/powertop.last
-journalctl --user -t smart-power-powertop -n 20 --no-pager
+# Main cadence
+CHECK_INTERVAL=2
+
+# CPU thresholds (load averages)
+LOAD_PERF_ENTER=4.0   # go to performance when 1m load >= 4.0
+LOAD_PERF_EXIT=2.5    # leave performance when 1m load < 2.5
+LOAD_BAL_ENTER=1.2    # go to balanced when 1m load >= 1.2
+LOAD_BAL_EXIT=0.5     # leave balanced for power-saver when 1m load < 0.5
+
+# Spike accelerator (short busy% heuristic)
+SPIKE_ACCEL_FRACTION=0.85
+SPIKE_CPU_BUSY_PCT_BASE_MULT=20
+
+# GPU utilization awareness (off by default)
+GPU_AWARE=0
+GPU_PERF_ENTER=50
+GPU_PERF_EXIT=35
+GPU_BAL_ENTER=15
+GPU_BAL_EXIT=5
+
+# CPU temperature awareness (off by default)
+TEMP_AWARE=0
+TEMP_PERF_ENTER=80
+TEMP_PERF_EXIT=70
+TEMP_BAL_ENTER=60
+TEMP_BAL_EXIT=45
+
+# GPU temperature trigger (on by default)
+GPU_TEMP_AWARE=1
+GPU_TEMP_PERF_ENTER=37  # promote to performance at or above 37 C
 ```
 
-Force a one‑shot test:
+### Notes on inputs
+
+- **CPU load** comes from `/proc/loadavg` (1 minute) for stability.
+- **Short busy%** comes from `/proc/stat` deltas and is a quick hint to catch spikes.
+- **GPU util**:
+  - NVIDIA: `nvidia-smi --query-gpu=utilization.gpu` (max of all GPUs).
+  - AMD: max value from `/sys/class/drm/*/gpu_busy_percent`.
+- **GPU temperature**:
+  - Tries **hwmon** first: it scans `/sys/class/hwmon` for `nvidia` or `amdgpu` entries and reads `temp*_input` values.
+  - Falls back to `nvidia-smi --query-gpu=temperature.gpu` if hwmon lookup fails.
+- **CPU temperature** tries `sensors` first and then `thermal_zone0` as a fallback.
+
+---
+
+## Debugging
+
+- See what the script is deciding in real time:
+  ```bash
+  journalctl --user -fu smart-power-daemon.service
+  ```
+- Inspect the current profile:
+  ```bash
+  powerprofilesctl get
+  ```
+- Check tray messages if it does not show up:
+  ```bash
+  systemctl --user status smart-power-tray.service
+  ```
+- Verify Ayatana typelib is present (for the tray):
+  ```bash
+  ls /usr/lib/x86_64-linux-gnu/girepository-1.0/AyatanaAppIndicator3-0.1.typelib
+  ```
+- Verify sensors:
+  ```bash
+  sensors
+  ```
+
+---
+
+## Service control
+
+All services are user services. No sudo needed here:
+
 ```bash
-rm -f ~/.cache/powertop.last
-echo balanced > ~/.cache/powerprofile.last
-echo power-saver > ~/.cache/powerprofile.override
-sleep 8
-cat ~/.cache/powertop.last
-journalctl --user -t smart-power-powertop -n 20 --no-pager
+systemctl --user restart smart-power-daemon.service
+systemctl --user restart smart-power-tray.service
+
+systemctl --user stop smart-power-daemon.service
+systemctl --user disable smart-power-daemon.service
+systemctl --user enable smart-power-daemon.service
+```
+
+If you change packages or libraries, re-run `./install.sh` to refresh dependencies and units.
+
+---
+
+## Security model
+
+- No root privileges while running.
+- Uses systemd hardening such as `NoNewPrivileges` and `PrivateTmp`. Home remains writable because the daemon uses `~/.cache`.
+- State files under `~/.cache` are small and have restrictive permissions (`umask 077`).
+
+---
+
+## FAQ
+
+**Will this drain my battery on a laptop?**  
+It is tuned for desktops by default. It still works on laptops. If you want to be more aggressive about power saving, raise the thresholds a little and increase `LOAD_BAL_EXIT` to drop back to power-saver sooner.
+
+**Why is YouTube not triggering performance?**  
+Video playback usually uses the decoder block, which is very efficient and keeps GPU temps and utilization low. That is good. You still get boosts when CPU load spikes or when 3D starts.
+
+**How do I force a profile for testing?**  
+Write to the override file:
+```bash
+echo performance > ~/.cache/powerprofile.override
+# back to auto
 rm -f ~/.cache/powerprofile.override
 ```
 
-Disable Powertop entirely by setting in the script:
-```bash
-POWERTOP_ON_POWERSAVER=0
-```
+**Do I need powertop or cpupower?**  
+No. Everything is done via `powerprofilesctl`.
+
+**Where are logs?**  
+Use `journalctl --user -u smart-power-daemon.service` and `journalctl --user -u smart-power-tray.service`.
 
 ---
 
-## 🔕 Notifications & overrides
+## License
 
-- Silence notifications (daemon & tray) via a flag file:
-  ```bash
-  touch ~/.cache/powerprofile.silent
-  # remove to re-enable
-  rm ~/.cache/powerprofile.silent
-  ```
-- Manual override (without the tray):
-  ```bash
-  echo performance > ~/.cache/powerprofile.override   # lock to performance
-  rm -f ~/.cache/powerprofile.override               # return to Auto
-  ```
-
-State files:
-```
-~/.cache/powerprofile.state        # last applied profile
-~/.cache/powerprofile.override     # presence = manual mode
-~/.cache/powertop.last             # last powertop run (if any)
-```
+MIT. See `LICENSE` if present. If not, treat the scripts as MIT licensed by default.
 
 ---
 
-## 🧪 Debugging
+## Credits
 
-Quick system snapshot:
-```bash
-~/bin/debug-powerprofile.sh
-```
-
-Services and logs:
-```bash
-systemctl --user status smart-power-daemon.service
-systemctl --user status smart-power-tray.service
-journalctl --user -u smart-power-daemon.service -b --no-pager
-journalctl --user -u smart-power-tray.service   -b --no-pager
-```
-
-Verify USB stays awake:
-```bash
-grep . /sys/bus/usb/devices/*/power/control | awk -F: '{print $2}' | sort -u
-# should show only: on
-```
-
-If you ever see repeated `pam_unix(sudo:auth)` lines:
-- You likely have an older version or another service calling `sudo -n` repeatedly
-- Stop and disable any old units, then reload:
-  ```bash
-  systemctl --user disable --now smart-power-daemon.service smart-power-tray.service
-  pkill -f auto-powerprofile.sh || true
-  systemctl --user daemon-reload
-  systemctl --user enable --now smart-power-daemon.service smart-power-tray.service
-  ```
-
----
-
-## 🧽 Uninstall
-
-```bash
-./uninstall.sh
-```
-
-This disables the services and removes their unit files. Your `~/bin/` scripts are left in place so you can keep or delete them.
-
-Optional cleanup:
-```bash
-rm -f ~/bin/auto-powerprofile.sh ~/bin/powerprofile-tray.py ~/bin/debug-powerprofile.sh
-systemctl --user daemon-reload
-```
-
----
-
-## 🔐 Security
-
-- The optional sudo rule is limited to:
-  ```
-  <your_user> ALL=(ALL) NOPASSWD: /usr/sbin/powertop, /usr/bin/cpupower
-  ```
-- If you prefer not to change sudoers, the daemon simply **skips** Powertop.
-
----
-
-## 🪪 License
-
-MIT © 2025 shiny-sand
+Built with love for quiet desktops that pounce like tigers when you open Blender.
