@@ -1,193 +1,239 @@
 #!/usr/bin/env bash
-# Smart Power Profile Manager for Ubuntu 25.10
-# Dynamically switches between power-saver, balanced, and performance profiles.
-# Integrates with powerprofilesctl and powertop for tuning, but skips USB autosuspend
-# to prevent audio or input dropouts (e.g. DACs, mice, keyboards).
+# Smart Power Profile Manager (load-only, no powertop)
+# Decides between power-saver / balanced / performance using powerprofilesctl.
+# Short retries to dodge "busy". Keeps ~/.cache state for the tray.
+# Manual override via ~/.cache/powerprofile.override
 
+set -euo pipefail
+
+# ===== Settings =====
 CHECK_INTERVAL=5
-POWERTOP_ON_POWERSAVER=1
 
-# Notification control:
-# 1 = show notifications
-# 0 = disable notifications permanently
-# Create ~/.cache/powerprofile.silent to mute temporarily
-NOTIFY=0
-SILENT_FILE="$HOME/.cache/powerprofile.silent"
+# p-p-d set retry
+PPD_SET_RETRIES=3
+PPD_SET_RETRY_SLEEP=1
 
-OVERRIDE_FILE="$HOME/.cache/powerprofile.override"
-STATE_FILE="$HOME/.cache/powerprofile.state"
+# Notifications
+NOTIFY=1
+CACHE_DIR="$HOME/.cache"
+SILENT_FILE="$CACHE_DIR/powerprofile.silent"
 
-# --- Thresholds ---
-# "Enter" thresholds (go up)
-LOAD_BALANCED_UP=1.5
-LOAD_PERF_UP=4.0
-TEMP_BALANCED_UP=55
-TEMP_PERF_UP=70
-GPU_UTIL_BALANCED_UP=20
-GPU_UTIL_PERF_UP=40
-GPU_PWR_PERF_UP=90
+# State files (tray compatibility)
+STATE_FILE="$CACHE_DIR/powerprofile.state"       # last applied profile (real)
+LAST_APPLIED_FILE="$CACHE_DIR/powerprofile.last" # last target we attempted
+OVERRIDE_FILE="$CACHE_DIR/powerprofile.override" # manual override target
 
-# "Exit" thresholds (go down)
-LOAD_BALANCED_DOWN=1.0
-LOAD_PERF_DOWN=2.5
-TEMP_BALANCED_DOWN=45
-TEMP_PERF_DOWN=60
-GPU_UTIL_BALANCED_DOWN=10
-GPU_UTIL_PERF_DOWN=25
-GPU_PWR_PERF_DOWN=60
+mkdir -p "$CACHE_DIR"
 
-FORCE_PERF_PROCS="steam|obs|resolve|blender|davinci|gamescope|proton"
+# ===== Thresholds (hysteresis) =====
+# Load uses 1-minute average from /proc/loadavg.
+LOAD_PERF_ENTER=8.0; LOAD_PERF_EXIT=5.0
+LOAD_BAL_ENTER=2.5;  LOAD_BAL_EXIT=1.0
 
-mkdir -p "$(dirname "$STATE_FILE")"
-have_nvidia=0
-command -v nvidia-smi >/dev/null && have_nvidia=1
-last_target=""
+# Optional GPU awareness. Off by default.
+GPU_AWARE=0
+GPU_PERF_ENTER=70
+GPU_PERF_EXIT=50
+GPU_BAL_ENTER=25
+GPU_BAL_EXIT=10
 
-# ---------------------------------------------------------------------
-# Helper: notifications
-# ---------------------------------------------------------------------
+# Optional temperature awareness. Off by default.
+TEMP_AWARE=0
+TEMP_PERF_ENTER=80
+TEMP_PERF_EXIT=70
+TEMP_BAL_ENTER=60
+TEMP_BAL_EXIT=45
+
+# ===== Helpers =====
 notify() {
-  # Skip notifications if disabled or silent mode active
-  if (( !NOTIFY )) || [[ -f "$SILENT_FILE" ]]; then
-    return
+  [[ $NOTIFY -eq 1 ]] || return 0
+  [[ -f "$SILENT_FILE" ]] && return 0
+  command -v notify-send >/dev/null 2>&1 || return 0
+  # $2 is optional
+  if [[ -n "${2-}" ]]; then
+    notify-send -a "Smart Power Profiles" "$1" "$2" || true
+  else
+    notify-send -a "Smart Power Profiles" "$1" || true
   fi
-  command -v notify-send >/dev/null || return
-  notify-send "Power Profile" "$1"
 }
 
-# ---------------------------------------------------------------------
-# Helper: safe PowerTOP tuning (skip USB autosuspend)
-# ---------------------------------------------------------------------
-safe_powertune() {
-  echo "Running PowerTOP (skip USB autosuspend completely)" >&2
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "[auto-powerprofile] Missing required command: $1" >&2
+    exit 1
+  }
+}
 
-  # Generate a temporary copy of powertop tunables without USB entries
-  TMPFILE=$(mktemp)
-  sudo powertop --auto-tune --explain >"$TMPFILE" 2>/dev/null || true
+# Numeric compare using bc; fallback to awk if bc missing
+num_lt() {
+  if command -v bc >/dev/null 2>&1; then
+    [[ $(echo "$1 < $2" | bc -l) -eq 1 ]]
+  else
+    awk -v a="$1" -v b="$2" 'BEGIN{exit !(a<b)}'
+  fi
+}
+num_ge() {
+  if command -v bc >/dev/null 2>&1; then
+    [[ $(echo "$1 >= $2" | bc -l) -eq 1 ]]
+  else
+    awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>=b)}'
+  fi
+}
 
-  # Manually apply only non-USB tunables
-  while IFS= read -r line; do
-    if [[ "$line" == *"/sys/bus/usb/"* ]]; then
+read_cpu_load() { awk '{print $1}' /proc/loadavg; }
+
+read_cpu_temp() {
+  [[ $TEMP_AWARE -eq 1 ]] || { echo 0; return; }
+  local t=""
+  if command -v sensors >/dev/null 2>&1; then
+    # Typical line: "Package id 0:  +55.0°C  (high = ...)"
+    t=$(sensors 2>/dev/null | awk '/Package id 0:/ {gsub(/\+|°C/,"",$4); print int($4)}' | head -n1)
+  fi
+  [[ -z "${t:-}" ]] && t=0
+  echo "$t"
+}
+
+have_nvidia=0
+command -v nvidia-smi >/dev/null 2>&1 && have_nvidia=1
+
+read_gpu_util() {
+  [[ $GPU_AWARE -eq 1 ]] || { echo 0; return; }
+  local max_util=0 nutil
+  if (( have_nvidia )); then
+    while IFS= read -r nutil; do
+      [[ "$nutil" =~ ^[0-9]+$ ]] || continue
+      (( nutil > max_util )) && max_util=$nutil
+    done < <(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true)
+  fi
+  echo "${max_util:-0}"
+}
+
+ppd_get() {
+  powerprofilesctl get 2>/dev/null || echo balanced
+}
+
+ppd_set_retry() {
+  local target="$1"
+  local i out
+  for ((i=1; i<=PPD_SET_RETRIES; i++)); do
+    out=""
+    if out=$(powerprofilesctl set "$target" 2>&1); then
+      return 0
+    fi
+    # Busy happens sometimes with intel_pstate
+    if grep -qiE "busy|Failed to activate CPU driver" <<<"$out"; then
+      sleep "$PPD_SET_RETRY_SLEEP"
       continue
     fi
-    if [[ "$line" == *"/sys/"*"/power/"* ]]; then
-      setting=$(echo "$line" | awk '{print $NF}')
-      [[ -f "$setting" ]] && echo auto | sudo tee "$setting" >/dev/null 2>&1
-    fi
-  done <"$TMPFILE"
+    # Other error. Try again briefly anyway.
+    sleep "$PPD_SET_RETRY_SLEEP"
+  done
+  return 1
+}
 
-  rm -f "$TMPFILE"
+# ===== Decision logic =====
+decide_profile() {
+  local load="$1" temp="$2" gpu="$3"
+  local current; current="$(ppd_get)"
 
-  # Finally, ensure all USB devices stay awake
-  for devpath in /sys/bus/usb/devices/*; do
-    if [ -f "$devpath/power/control" ]; then
-      echo on | sudo tee "$devpath/power/control" >/dev/null
-    fi
+  # Manual override wins
+  if [[ -f "$OVERRIDE_FILE" ]]; then
+    local o; o=$(<"$OVERRIDE_FILE")
+    [[ -n "$o" ]] && { echo "$o"; return; }
+  fi
+
+  # Useful flags so temp/gpu can be disabled cleanly
+  local hot=0 cool=1 busy_gpu=0 idle_gpu=1
+  if [[ $TEMP_AWARE -eq 1 ]]; then
+    (( temp >= TEMP_PERF_ENTER )) && hot=1
+    if (( temp < TEMP_PERF_EXIT )); then cool=1; else cool=0; fi
+  fi
+  if [[ $GPU_AWARE -eq 1 ]]; then
+    (( gpu >= GPU_PERF_ENTER )) && busy_gpu=1
+    if (( gpu < GPU_PERF_EXIT )); then idle_gpu=1; else idle_gpu=0; fi
+  fi
+
+  case "$current" in
+    performance)
+      if $(num_lt "$load" "$LOAD_PERF_EXIT") && (( cool == 1 )) && (( idle_gpu == 1 )); then
+        if $(num_lt "$load" "$LOAD_BAL_EXIT") && (( (TEMP_AWARE==0) || (temp < TEMP_BAL_EXIT) )) && (( (GPU_AWARE==0) || (gpu < GPU_BAL_EXIT) )); then
+          echo "power-saver"
+        else
+          echo "balanced"
+        fi
+      else
+        echo "performance"
+      fi
+      ;;
+    balanced)
+      if $(num_ge "$load" "$LOAD_PERF_ENTER") || (( hot == 1 )) || (( busy_gpu == 1 )); then
+        echo "performance"
+      elif $(num_lt "$load" "$LOAD_BAL_EXIT") && (( (TEMP_AWARE==0) || (temp < TEMP_BAL_EXIT) )) && (( (GPU_AWARE==0) || (gpu < GPU_BAL_EXIT) )); then
+        echo "power-saver"
+      else
+        echo "balanced"
+      fi
+      ;;
+    power-saver|*)
+      if $(num_ge "$load" "$LOAD_PERF_ENTER") || (( hot == 1 )) || (( busy_gpu == 1 )); then
+        echo "performance"
+      elif $(num_ge "$load" "$LOAD_BAL_ENTER") || (( (TEMP_AWARE==1) && (temp >= TEMP_BAL_ENTER) )) || (( (GPU_AWARE==1) && (gpu >= GPU_BAL_ENTER) )); then
+        echo "balanced"
+      else
+        echo "power-saver"
+      fi
+      ;;
+  esac
+}
+
+# ===== Apply and record =====
+apply_profile() {
+  local target="$1"
+  local last_target=""
+  [[ -r "$LAST_APPLIED_FILE" ]] && last_target=$(<"$LAST_APPLIED_FILE")
+
+  local before; before="$(ppd_get)"
+  if [[ "$before" != "$target" ]]; then
+    ppd_set_retry "$target" || true
+  fi
+
+  # Read back the real state and record that for the tray
+  local actual; actual="$(ppd_get)"
+
+  # Only notify when the effective profile changed
+  if [[ "$actual" != "$before" ]]; then
+    case "$actual" in
+      power-saver) notify "Power Saver" "Lower clocks, quieter." ;;
+      balanced)    notify "Balanced" "General purpose." ;;
+      performance) notify "Performance" "Higher clocks for heavy load." ;;
+    esac
+  fi
+
+  # Update files: last target we tried, and the actual current profile
+  if [[ "$last_target" != "$target" ]]; then
+    echo "$target" > "$LAST_APPLIED_FILE" || true
+  fi
+  echo "$actual" > "$STATE_FILE" || true
+}
+
+# ===== Preflight =====
+preflight() {
+  need_cmd powerprofilesctl
+  # Optional tools are checked lazily: bc, sensors, nvidia-smi, notify-send
+}
+
+# ===== Main loop =====
+main_loop() {
+  : > "$STATE_FILE" || true
+  while true; do
+    load="$(read_cpu_load)"
+    temp="$(read_cpu_temp)"
+    gpu="$(read_gpu_util)"
+    target="$(decide_profile "$load" "$temp" "$gpu")"
+    apply_profile "$target"
+    sleep "$CHECK_INTERVAL"
   done
 }
 
-
-# ---------------------------------------------------------------------
-# Helper: set power profile
-# ---------------------------------------------------------------------
-set_profile() {
-  local target="$1"
-  local current
-  current=$(powerprofilesctl get)
-  [[ "$current" == "$target" ]] && return
-  powerprofilesctl set "$target"
-
-  case "$target" in
-    power-saver)
-      ((POWERTOP_ON_POWERSAVER)) && safe_powertune
-      ((NOTIFY)) && [[ ! -f "$SILENT_FILE" ]] && notify "🌙 Quiet mode (power-saver)"
-      ;;
-    balanced)
-      ((NOTIFY)) && [[ ! -f "$SILENT_FILE" ]] && notify "⚙️ Balanced mode"
-      ;;
-    performance)
-      ((NOTIFY)) && [[ ! -f "$SILENT_FILE" ]] && notify "⚡ Performance mode"
-      ;;
-  esac
-
-  echo "$target" > "$STATE_FILE"
-}
-
-
-# ---------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------
-while true; do
-  # Manual override
-  if [[ -f "$OVERRIDE_FILE" ]]; then
-    override=$(<"$OVERRIDE_FILE")
-    [[ -n "$override" ]] && set_profile "$override"
-    sleep "$CHECK_INTERVAL"
-    continue
-  fi
-
-  load=$(awk '{print $1}' /proc/loadavg)
-  temp=$(sensors 2>/dev/null | awk '/Package id 0:/ {gsub("\\+|°C",""); print int($4)}' | head -n1)
-  [[ -z "$temp" ]] && temp=0
-
-  gpu_util=0; gpu_pwr=0
-  if (( have_nvidia )); then
-    line=$(nvidia-smi --query-gpu=utilization.gpu,power.draw --format=csv,noheader,nounits 2>/dev/null | head -n1)
-    gpu_util=$(awk -F',' '{gsub(" ",""); print $1+0}' <<<"$line")
-    gpu_pwr=$(awk -F',' '{gsub(" ",""); print $2+0}' <<<"$line")
-  fi
-
-  force_perf=0
-  if pgrep -falE "$FORCE_PERF_PROCS" >/dev/null 2>&1; then
-    force_perf=1
-  fi
-
-  target="$last_target"
-
-  case "$last_target" in
-    power-saver)
-      if (( force_perf==1 )) ||
-         (( $(echo "$load > $LOAD_PERF_UP" | bc -l) )) ||
-         (( $(echo "$temp > $TEMP_PERF_UP" | bc -l) )) ||
-         (( $(echo "$gpu_util > $GPU_UTIL_PERF_UP" | bc -l) )) ||
-         (( $(echo "$gpu_pwr > $GPU_PWR_PERF_UP" | bc -l) )); then
-        target="performance"
-      elif (( $(echo "$load > $LOAD_BALANCED_UP" | bc -l) )) ||
-           (( $(echo "$temp > $TEMP_BALANCED_UP" | bc -l) )) ||
-           (( $(echo "$gpu_util > $GPU_UTIL_BALANCED_UP" | bc -l) )); then
-        target="balanced"
-      fi
-      ;;
-    balanced)
-      if (( force_perf==1 )) ||
-         (( $(echo "$load > $LOAD_PERF_UP" | bc -l) )) ||
-         (( $(echo "$temp > $TEMP_PERF_UP" | bc -l) )) ||
-         (( $(echo "$gpu_util > $GPU_UTIL_PERF_UP" | bc -l) )) ||
-         (( $(echo "$gpu_pwr > $GPU_PWR_PERF_UP" | bc -l) )); then
-        target="performance"
-      elif (( $(echo "$load < $LOAD_BALANCED_DOWN" | bc -l) )) &&
-           (( $(echo "$temp < $TEMP_BALANCED_DOWN" | bc -l) )) &&
-           (( $(echo "$gpu_util < $GPU_UTIL_BALANCED_DOWN" | bc -l) )); then
-        target="power-saver"
-      fi
-      ;;
-    performance)
-      if (( $(echo "$load < $LOAD_PERF_DOWN" | bc -l) )) &&
-         (( $(echo "$temp < $TEMP_PERF_DOWN" | bc -l) )) &&
-         (( $(echo "$gpu_util < $GPU_UTIL_PERF_DOWN" | bc -l) )) &&
-         (( $(echo "$gpu_pwr < $GPU_PWR_PERF_DOWN" | bc -l) )); then
-        target="balanced"
-      fi
-      ;;
-    *)
-      target="power-saver"
-      ;;
-  esac
-
-  if [[ "$target" != "$last_target" ]]; then
-    last_target="$target"
-    set_profile "$target"
-  fi
-
-  sleep "$CHECK_INTERVAL"
-done
+preflight
+main_loop

@@ -1,38 +1,38 @@
-# Smart Power Profiles
+# Smart Power Profiles (Ubuntu 25.10+)
 
-Smart Power Profiles automatically switches between **power-saver**, **balanced**, and **performance** on Ubuntu 25.10 based on live **CPU load, temps, GPU activity, and active apps**. It also ships a lightweight tray so you can click to change modes or temporarily override “Auto”.
+Smart Power Profiles auto-switches between **power-saver**, **balanced**, and **performance** based on live **CPU load**, **CPU temps**, and **GPU activity**. It runs as a **systemd --user** daemon with a tiny tray app for quick overrides.
 
-The daemon is **systemd --user** friendly, safe by default, and tuned to avoid common Linux pitfalls like **USB autosuspend breaking DACs/keyboards**.
+This project is designed to be **clone → install → go** for the average GitHub user. No root daemons. Sensible defaults. Safe fallbacks. Optional Powertop tuning.
 
 ---
 
-## ✨ Features
+## ✨ Highlights
 
-- **Auto switching** between power-saver / balanced / performance
-- **Hysteresis**: different enter/exit thresholds to prevent flapping
-- **Fast bump** to Performance for heavy load or when apps like Steam/OBS are running
-- Optional **Powertop integration** when entering power-saver
-  - Implemented in **USB‑safe** mode (skips USB autosuspend entirely)
-- **Tray indicator** with emoji status: 🌙 ⚙️ ⚡ and an **Auto** option
-- **Manual override** via tray or file (and auto-resume)
-- **Quiet mode** (no notifications) with a single flag file
-- Robust **systemd --user** services for both daemon + tray
+- **Auto switching** with hysteresis to avoid flapping
+- **GPU aware**: NVIDIA via `nvidia-smi`, AMD via `gpu_busy_percent`
+- **Heavy-app fast path** (Steam/OBS/Blender etc. bump to performance)
+- **Optional Powertop** when entering power‑saver (USB‑safe)
+- **Tray indicator (text-only)** that shows **A:** or **M:** and the active profile, e.g. `A: Balanced` or `M: Performance`
+- **Manual override** via tray or a simple flag file
+- **Notification silence** via a single flag file
+- Clean **systemd --user** services; no PAM spam or password prompts
 
 ---
 
 ## 🧩 Requirements
 
-- Ubuntu 25.10 (GNOME / Wayland works fine)
-- Packages: `powerprofilesctl` (built-in via power-profiles-daemon), `powertop` (optional), `lm-sensors`, `nvidia-smi` (optional, NVIDIA)
-- AppIndicator host (Ubuntu enables by default)
+- Ubuntu 25.10 (GNOME/Wayland tested)
+- Packages (installer will pull them):  
+  `python3-gi gir1.2-gtk-3.0 libnotify-bin power-profiles-daemon lm-sensors powertop bc`
+- Optional:
+  - NVIDIA: `nvidia-smi` (provided by the driver) for GPU util
+  - `cpupower` (from `linux-tools-common` on Ubuntu) for governor hints
 
-> NVIDIA is optional. If `nvidia-smi` is unavailable, GPU checks are skipped.
+> If NVIDIA/AMD metrics aren’t available, the daemon still works using CPU load/temps.
 
 ---
 
 ## 🚀 Install / Update
-
-Clone and install (safe to re-run for updates):
 
 ```bash
 git clone https://github.com/shiny-sand/smart-power-profiles.git
@@ -40,46 +40,49 @@ cd smart-power-profiles
 ./install.sh
 ```
 
-Installer does:
-- Copies scripts into `~/bin/`
-- Creates/updates **systemd --user** units
-- Enables and starts both services
+The installer:
+- Installs deps
+- Copies scripts to `~/bin/`
+- Creates **systemd --user** units
+- Starts **daemon** and **tray**
 
-Manage services:
-
-```bash
-systemctl --user status smart-power-daemon.service
-systemctl --user status smart-power-tray.service
-
-systemctl --user restart smart-power-daemon.service smart-power-tray.service
+It also **offers** (prompted) to create a **sudoers snippet** that allows passwordless `powertop` and `cpupower` for your user:
 ```
-
-> If you previously had a `.desktop` autostart for the tray, you can remove:
-> `~/.config/autostart/powerprofile-tray.desktop` and `~/.local/share/applications/powerprofile-tray.desktop`.
+/etc/sudoers.d/smart-power
+<your_user> ALL=(ALL) NOPASSWD: /usr/sbin/powertop, /usr/bin/cpupower
+```
+This is optional. If you skip it, the daemon simply **skips Powertop** instead of spamming PAM.
 
 ---
 
-## ⚙️ How it works (and what to tweak)
+## 🖥️ Tray (text-only, compact)
 
-The daemon reads system state every few seconds and decides a target profile:
+The tray label shows:
+- `A: <Profile>` when **Auto** is active
+- `M: <Profile>` when **Manual override** is active
 
-- **Enter thresholds** (to go up):
-  - `LOAD_BALANCED_UP=1.5`, `LOAD_PERF_UP=4.0`
-  - `TEMP_BALANCED_UP=55`, `TEMP_PERF_UP=70` (°C, CPU package)
-  - `GPU_UTIL_BALANCED_UP=20`, `GPU_UTIL_PERF_UP=40` (%)
-  - `GPU_PWR_PERF_UP=90` (W, NVIDIA)
-- **Exit thresholds** (to go down):
-  - `LOAD_BALANCED_DOWN=1.0`, `LOAD_PERF_DOWN=2.5`
-  - `TEMP_BALANCED_DOWN=45`, `TEMP_PERF_DOWN=60`
-  - `GPU_UTIL_BALANCED_DOWN=10`, `GPU_UTIL_PERF_DOWN=25`
-  - `GPU_PWR_PERF_DOWN=60`
+Examples:
+- `A: Balanced`
+- `M: Performance`
+- `A: Power Saver`
 
-Processes that **force Performance** if detected:
-```
-steam|obs|resolve|blender|davinci|gamescope|proton
-```
+Menu items:
+- **Auto** (remove manual override)
+- **Power Saver / Balanced / Performance** (manual pick)
+- **Notifications** toggle
+- **Appearance** (label/format, no icons)
+- **Open Debug Snapshot**
+- **Quit**
 
-You can tune any of these at the top of `~/bin/auto-powerprofile.sh` and then:
+> The project intentionally avoids themed icons because they’re unreliable across themes and can render as `…` when a theme doesn’t ship the name. Text is robust and minimal.
+
+---
+
+## ⚙️ How it decides
+
+The daemon samples every few seconds and chooses a target profile. It uses **hysteresis thresholds** and a **“heavy app” fast path** to jump straight to **performance** when certain processes are detected (Steam, OBS, Blender, DaVinci, etc.).
+
+You can tune thresholds at the top of `~/bin/auto-powerprofile.sh`, then:
 
 ```bash
 systemctl --user restart smart-power-daemon.service
@@ -87,102 +90,92 @@ systemctl --user restart smart-power-daemon.service
 
 ---
 
-## 🔕 Notifications & Silent Mode
+## 🔌 Powertop integration (USB‑safe)
 
-- By default, notifications are **off** in the daemon (`NOTIFY=0` inside the script).
-- You can **temporarily** silence both daemon and tray by creating a flag file:
+When entering **power-saver**, the daemon can run:
+
+- `powertop --auto-tune` (if allowed without password)
+- Then **keeps USB awake** (`power/control=on`) to avoid DAC/keyboard/mouse/webcam issues
+
+It will **not** attempt to run Powertop unless the NOPASSWD rule exists (or you explicitly allowed it). This prevents **`pam_unix` spam** in the journal from password prompts that can’t be answered inside a user service.
+
+You can verify Powertop ran with these markers/logs:
+```bash
+cat ~/.cache/powertop.last
+journalctl --user -t smart-power-powertop -n 20 --no-pager
+```
+
+Force a one‑shot test:
+```bash
+rm -f ~/.cache/powertop.last
+echo balanced > ~/.cache/powerprofile.last
+echo power-saver > ~/.cache/powerprofile.override
+sleep 8
+cat ~/.cache/powertop.last
+journalctl --user -t smart-power-powertop -n 20 --no-pager
+rm -f ~/.cache/powerprofile.override
+```
+
+Disable Powertop entirely by setting in the script:
+```bash
+POWERTOP_ON_POWERSAVER=0
+```
+
+---
+
+## 🔕 Notifications & overrides
+
+- Silence notifications (daemon & tray) via a flag file:
   ```bash
   touch ~/.cache/powerprofile.silent
   # remove to re-enable
   rm ~/.cache/powerprofile.silent
   ```
-- If you want the tray to **never** notify, the installer supports an env flag in the tray unit:
-  ```ini
-  # ~/.config/systemd/user/smart-power-tray.service
-  [Service]
-  Environment=POWERPROFILE_NOTIFY=0
-  ```
-  Then:
+- Manual override (without the tray):
   ```bash
-  systemctl --user daemon-reload
-  systemctl --user restart smart-power-tray.service
+  echo performance > ~/.cache/powerprofile.override   # lock to performance
+  rm -f ~/.cache/powerprofile.override               # return to Auto
   ```
 
----
-
-## 🔌 Powertop (USB‑safe)
-
-When entering **power-saver**, Smart Power Profiles can apply Powertop tunables to save extra watts. To prevent common issues with **USB DACs, keyboards, mice, webcams**, we **skip USB autosuspend entirely**. CPU/PCIe/SATA tunables are still applied.
-
-This avoids kernel spam like:
+State files:
 ```
-usb_set_interface failed (-110)
-```
-
-Powertop is **optional**. You can toggle it inside `~/bin/auto-powerprofile.sh`:
-
-```bash
-POWERTOP_ON_POWERSAVER=1   # enable (default)
-# POWERTOP_ON_POWERSAVER=0 # disable
-```
-
-### Allowing Powertop without password (optional)
-`powertop` needs sudo. As a user service, there’s no password prompt. Grant **passwordless sudo for powertop only**:
-
-```bash
-sudo visudo -f /etc/sudoers.d/powertop-nopasswd
-```
-Add this line (replace `<your_username>`):
-```
-<your_username> ALL=(ALL) NOPASSWD: /usr/bin/powertop
-```
-
-If you prefer **not** to change sudoers, set `POWERTOP_ON_POWERSAVER=0`.
-
----
-
-## 🖱️ Tray
-
-The tray shows the current mode via emoji:
-- 🌙 **power-saver**
-- ⚙️ **balanced**
-- ⚡ **performance**
-
-Menu options:
-- Pick a mode to **override** the daemon
-- Choose **Auto (remove override)** to return control to the daemon
-
-Under the hood it writes/reads:
-```
-~/.cache/powerprofile.override
-~/.cache/powerprofile.state
+~/.cache/powerprofile.state        # last applied profile
+~/.cache/powerprofile.override     # presence = manual mode
+~/.cache/powertop.last             # last powertop run (if any)
 ```
 
 ---
 
 ## 🧪 Debugging
 
-Quick snapshot:
+Quick system snapshot:
 ```bash
-~/Projects/smart-power-profiles/bin/debug-powerprofile.sh
+~/bin/debug-powerprofile.sh
 ```
 
-Check services and logs:
+Services and logs:
 ```bash
 systemctl --user status smart-power-daemon.service
 systemctl --user status smart-power-tray.service
-
 journalctl --user -u smart-power-daemon.service -b --no-pager
-journalctl --user -u smart-power-tray.service -b --no-pager
+journalctl --user -u smart-power-tray.service   -b --no-pager
 ```
 
-Verify USB autosuspend is **off**:
+Verify USB stays awake:
 ```bash
-grep . /sys/bus/usb/devices/*/power/control | cut -d: -f2- | sort -u
-# should print only: on
+grep . /sys/bus/usb/devices/*/power/control | awk -F: '{print $2}' | sort -u
+# should show only: on
 ```
 
-Seeing repeated `usb_set_interface failed (-110)`? That’s a USB device failing to wake from suspend. The script already avoids suspending USB, but if you customized anything or run other tuners, ensure all USB `power/control` files are `on`.
+If you ever see repeated `pam_unix(sudo:auth)` lines:
+- You likely have an older version or another service calling `sudo -n` repeatedly
+- Stop and disable any old units, then reload:
+  ```bash
+  systemctl --user disable --now smart-power-daemon.service smart-power-tray.service
+  pkill -f auto-powerprofile.sh || true
+  systemctl --user daemon-reload
+  systemctl --user enable --now smart-power-daemon.service smart-power-tray.service
+  ```
 
 ---
 
@@ -192,27 +185,23 @@ Seeing repeated `usb_set_interface failed (-110)`? That’s a USB device failing
 ./uninstall.sh
 ```
 
-What it does:
-- Disables & stops the **systemd --user** services
-- Removes their unit files from `~/.config/systemd/user/`
-- Leaves your `~/bin/` scripts in place (so you can keep or manually remove them)
+This disables the services and removes their unit files. Your `~/bin/` scripts are left in place so you can keep or delete them.
 
-Manual cleanup (optional):
+Optional cleanup:
 ```bash
-rm -f ~/bin/auto-powerprofile.sh ~/bin/powerprofile-tray.py
+rm -f ~/bin/auto-powerprofile.sh ~/bin/powerprofile-tray.py ~/bin/debug-powerprofile.sh
 systemctl --user daemon-reload
 ```
 
 ---
 
-## 🔐 Security notes
+## 🔐 Security
 
-- The optional sudo rule is **limited to `powertop` only**:
+- The optional sudo rule is limited to:
   ```
-  <your_username> ALL=(ALL) NOPASSWD: /usr/bin/powertop
+  <your_user> ALL=(ALL) NOPASSWD: /usr/sbin/powertop, /usr/bin/cpupower
   ```
-- If you’re not comfortable with that, set `POWERTOP_ON_POWERSAVER=0`.
-- The daemon and tray run as your **regular user** under `systemd --user`; they do not require admin privileges otherwise.
+- If you prefer not to change sudoers, the daemon simply **skips** Powertop.
 
 ---
 
