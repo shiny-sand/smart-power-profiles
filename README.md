@@ -1,4 +1,3 @@
-
 # Smart Power Profiles (Ubuntu 25.10+)
 
 Save watts when your desktop is idle and snap to full performance when you start real work.  
@@ -258,3 +257,65 @@ MIT. See `LICENSE` if present. If not, treat the scripts as MIT licensed by defa
 ## Credits
 
 Built with love for quiet desktops that pounce like tigers when you open Blender.
+---
+
+## Autostart Troubleshooting (Tray not loading at login)
+
+If the tray does not appear automatically after reboot or login, it usually means
+your **user systemd instance** is not fully active when the desktop starts.
+Follow these steps once to make it persistent:
+
+```bash
+# Enable user lingering (ensures your user services start at login)
+sudo loginctl enable-linger "$USER"
+
+# Make sure the graphical session target exists
+systemctl --user enable --now graphical-session.target
+
+# Reload and enable the Smart Power services
+systemctl --user daemon-reload
+systemctl --user enable --now smart-power-daemon.service smart-power-tray.service
+```
+
+If your desktop still loads too quickly and the tray starts before a valid
+display environment exists, add a small delay:
+
+```bash
+systemctl --user edit smart-power-tray.service
+```
+Add:
+```
+[Service]
+ExecStartPre=/bin/sleep 10
+```
+
+Then reload and restart:
+```bash
+systemctl --user daemon-reload
+systemctl --user restart smart-power-tray.service
+```
+
+You can also add a standard GNOME autostart entry as a fallback:
+
+```bash
+mkdir -p ~/.config/autostart
+cat > ~/.config/autostart/smart-power-tray.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Exec=/home/$USER/bin/powerprofile-tray.py
+Hidden=false
+X-GNOME-Autostart-enabled=true
+Name=Smart Power Tray
+Comment=Power profile indicator
+EOF
+```
+
+After reboot, verify:
+```bash
+systemctl --user status smart-power-tray.service
+journalctl --user -u smart-power-tray.service -b --no-pager | tail -20
+```
+
+Once configured, the tray will appear automatically after each login,
+with both services (`smart-power-daemon` and `smart-power-tray`)
+running continuously in your session.
