@@ -60,18 +60,20 @@ install -m 0755 "$SRC_DIR/auto-powerprofile.sh"   "$DEST_DIR/auto-powerprofile.s
 install -m 0755 "$SRC_DIR/powerprofile-tray.py"   "$DEST_DIR/powerprofile-tray.py"
 install -m 0755 "$SRC_DIR/debug-powerprofile.sh"  "$DEST_DIR/debug-powerprofile.sh"
 
+# Enable lingering so user services start after login
+info "Ensuring user lingering is enabled…"
+sudo loginctl enable-linger "$USER" || true
+
 # User services — minimal, stable, no hardening (avoids CAPABILITIES step)
 cat > "$USER_SYSTEMD/smart-power-daemon.service" <<'EOF'
 [Unit]
 Description=Smart Power Profiles (auto switcher)
-# Start only when a desktop session exists
-ConditionEnvironment=|DISPLAY
-ConditionEnvironment=|WAYLAND_DISPLAY
 After=graphical-session.target
 Wants=graphical-session.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sleep 5
 ExecStart=%h/bin/auto-powerprofile.sh
 Restart=always
 RestartSec=2
@@ -85,13 +87,12 @@ EOF
 cat > "$USER_SYSTEMD/smart-power-tray.service" <<'EOF'
 [Unit]
 Description=Smart Power Profiles Tray
-ConditionEnvironment=|DISPLAY
-ConditionEnvironment=|WAYLAND_DISPLAY
 After=graphical-session.target
 Wants=graphical-session.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sleep 10
 ExecStart=%h/bin/powerprofile-tray.py
 Restart=always
 RestartSec=2
